@@ -2344,9 +2344,10 @@ class LRS_Accessor(object):
         """
         Clip linearly-referenced events to a polygon boundary. The portion of
         each event geometry which falls inside (or outside) the mask is
-        retained, and its begin and end measures are recovered by projecting
-        the endpoints of that portion onto the M-enabled geometry of the
-        source event.
+        retained, its begin and end measures are recovered by projecting the
+        endpoints of that portion onto the M-enabled geometry of the source
+        event, and its geometries are cut from the source event at those
+        measures.
 
         Parameters
         ----------
@@ -2362,10 +2363,11 @@ class LRS_Accessor(object):
             by geometric overlay and no spatial predicate is consulted.
         cut_geom : bool, default True
             Whether to retain clipped geometries in the result. When True, the
-            result is a GeoDataFrame whose geometries are the clipped
-            geometries themselves, with M-enabled geometries rebuilt to match.
-            When False, the geometry and M-enabled geometry columns are
-            dropped and only the clipped measures are returned.
+            result is a GeoDataFrame whose geometries and M-enabled geometries
+            are cut from the source events at the clipped measures, so they
+            carry the source events' M values. When False, the geometry and
+            M-enabled geometry columns are dropped and only the clipped
+            measures are returned.
 
         Returns
         -------
@@ -2434,20 +2436,22 @@ class LRS_Accessor(object):
                 "geometries. Use `split()` for LineString masks."
             )
 
-        # Build the filter polygon and clip event geometries against it
+        # Union the mask polygons and clip event geometries against them
         geoms = np.asarray(self.df[self.geom_col].values)
-        filter_geom = shapely.union_all(mask_geom)
-        op = shapely.intersection if keep == 'inside' else shapely.difference
-        clipped = op(geoms, filter_geom)
+        mask_union = shapely.union_all(mask_geom)
+        # Intersection keeps the portions inside the mask, difference the
+        # portions outside
+        overlay = shapely.intersection if keep == 'inside' else shapely.difference
+        clipped = overlay(geoms, mask_union)
 
         # Flatten clipped geometries to their component parts, tracking the
         # source event each part was clipped from. Overlay returns a Point
         # where the mask boundary grazes an event without crossing it, and an
         # empty LineString where nothing of an event is retained; neither is a
         # valid output event.
-        parts, source_index = shapely.get_parts(clipped, return_index=True)
-        retain = (shapely.get_type_id(parts) == 1) & ~shapely.is_empty(parts)
-        parts, source_index = parts[retain], source_index[retain]
+        clipped_parts, source_index = shapely.get_parts(clipped, return_index=True)
+        retain = (shapely.get_type_id(clipped_parts) == 1) & ~shapely.is_empty(clipped_parts)
+        clipped_parts, source_index = clipped_parts[retain], source_index[retain]
 
         # Assemble the clipped events, retaining source event attributes
         result = self.df.iloc[source_index].copy().reset_index(drop=True)
@@ -2459,26 +2463,34 @@ class LRS_Accessor(object):
         if len(result) == 0:
             return result
 
-        # Recover measures by projecting the endpoints of each clipped part
-        # onto the M-enabled geometry of its source event
-        geoms_m = np.asarray(self.geoms_m)[source_index]
-        m_beg = geometry.line_locate_point_m(
-            geoms_m, shapely.get_point(parts, 0), m=True
+        # Recover measures by projecting the first and last points of each
+        # clipped part onto the M-enabled geometry of its source event,
+        # taking the lower as the begin measure in case a part runs against
+        # its source event
+        source_geoms_m = np.asarray(self.geoms_m)[source_index]
+        beg_m = geometry.line_locate_point_m(
+            source_geoms_m, shapely.get_point(clipped_parts, 0), m=True
         )
-        m_end = geometry.line_locate_point_m(
-            geoms_m, shapely.get_point(parts, -1), m=True
+        end_m = geometry.line_locate_point_m(
+            source_geoms_m, shapely.get_point(clipped_parts, -1), m=True
         )
-        result[self.beg_col] = np.minimum(m_beg, m_end)
-        result[self.end_col] = np.maximum(m_beg, m_end)
+        result[self.beg_col] = np.minimum(beg_m, end_m)
+        result[self.end_col] = np.maximum(beg_m, end_m)
 
-        # Apply clipped geometries, rebuilding the inherited M-enabled
-        # geometries which still describe the full source events
+        # Replace the inherited geometries, which still describe the full
+        # source events, with geometries cut from the source events at the
+        # clipped measures
         if cut_geom:
+            cut_geoms_m = np.array([
+                source_geom_m.cut(beg, end, m=True) for source_geom_m, beg, end in
+                zip(source_geoms_m, result[self.beg_col], result[self.end_col])
+            ])
             result[self.geom_col] = gpd.GeoSeries(
-                parts, crs=getattr(self.df, 'crs', None)
+                [geom_m.geom for geom_m in cut_geoms_m],
+                crs=getattr(self.df, 'crs', None),
             )
             if self.geom_m_col in result.columns:
-                result[self.geom_m_col] = result.lr.build_geom_m()
+                result[self.geom_m_col] = cut_geoms_m
 
         # Overlay does not guarantee the ordering of parts along their source
         # event geometries

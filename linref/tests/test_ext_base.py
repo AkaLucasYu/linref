@@ -23,7 +23,7 @@ from linref.options import options, set_default_lrs
 from linref.ext.base import check_compatibility
 from linref.errors import (
     LRSConfigurationError, LRSCompatibilityError, GeometryTopologyError,
-    GeometryTopologyWarning, GeometryScaleWarning, LinrefDeprecationWarning,
+    GeometryTopologyWarning, GeometryScaleWarning,
 )
 from linref.geometry import LineStringM
 
@@ -2495,17 +2495,10 @@ class TestClipMethod(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.roads.lr.clip(self.polygon, keep='middle')
 
-    def test_clip_predicate_deprecated(self):
-        """The predicate parameter warns and is otherwise ignored."""
-        # An invalid predicate no longer raises; it is never consulted
-        with self.assertWarns(LinrefDeprecationWarning):
-            self.roads.lr.clip(self.polygon, predicate='not_a_predicate')
-
-    def test_clip_no_predicate_does_not_warn(self):
-        """Omitting the predicate parameter raises no deprecation warning."""
-        with warnings.catch_warnings():
-            warnings.simplefilter('error', LinrefDeprecationWarning)
-            self.roads.lr.clip(self.polygon)
+    def test_clip_invalid_predicate(self):
+        """Invalid predicate value raises ValueError."""
+        with self.assertRaises(ValueError):
+            self.roads.lr.clip(self.polygon, predicate='intersects')
 
     def test_clip_non_polygon_mask(self):
         """Non-polygon mask raises TypeError."""
@@ -2689,7 +2682,8 @@ class TestClipBoundaryPrecision(unittest.TestCase):
         )
 
     def test_clip_random_chords(self):
-        """Chords through a circular mask clip correctly regardless of angle."""
+        """Chords through a circular mask clip correctly regardless of angle,
+        for either predicate, since no chord runs along the mask boundary."""
         rng = np.random.default_rng(0)
         radius = 20000
         tested = 0
@@ -2707,20 +2701,22 @@ class TestClipBoundaryPrecision(unittest.TestCase):
             tested += 1
 
             roads = self._build(line)
-            inside = roads.lr.clip(self.mask, keep='inside')
-            outside = roads.lr.clip(self.mask, keep='outside')
+            for predicate in ('covered_by', 'within'):
+                with self.subTest(predicate=predicate):
+                    inside = roads.lr.clip(self.mask, keep='inside', predicate=predicate)
+                    outside = roads.lr.clip(self.mask, keep='outside', predicate=predicate)
 
-            self.assertEqual(len(inside), 1)
-            self.assertEqual(len(outside), 2)
-            self.assertAlmostEqual(
-                inside.geometry.iloc[0].difference(self.mask).length,
-                0.0, places=6,
-            )
-            self.assertAlmostEqual(
-                (inside['end'] - inside['beg']).sum() +
-                (outside['end'] - outside['beg']).sum(),
-                line.length, places=6,
-            )
+                    self.assertEqual(len(inside), 1)
+                    self.assertEqual(len(outside), 2)
+                    self.assertAlmostEqual(
+                        inside.geometry.iloc[0].difference(self.mask).length,
+                        0.0, places=6,
+                    )
+                    self.assertAlmostEqual(
+                        (inside['end'] - inside['beg']).sum() +
+                        (outside['end'] - outside['beg']).sum(),
+                        line.length, places=6,
+                    )
         # Guard against the sampling filter silently rejecting every chord
         self.assertGreater(tested, 10)
 
@@ -2845,6 +2841,61 @@ class TestClipGeometryTopology(unittest.TestCase):
                     warnings.simplefilter('error', GeometryTopologyWarning)
                     result = roads.lr.clip(self.mask, invalid_topology=invalid_topology)
                 self.assertEqual(result['route'].unique().tolist(), ['A'])
+
+
+class TestClipPredicate(unittest.TestCase):
+    """
+    Test that `predicate` decides whether the portions of events which run
+    along the mask boundary are kept inside or outside the mask.
+    """
+
+    def setUp(self):
+        """Set up a square mask and an event which approaches it from
+        outside, runs along its edge, then turns inside."""
+        self.mask = Point(5, 5).buffer(5, cap_style='square')
+        # Outside at measures 0 to 5, along the edge y=0 at 5 to 8, and
+        # inside at 8 to 13
+        line = LineString([(5, -5), (5, 0), (8, 0), (8, 5)])
+        df = gpd.GeoDataFrame({
+            'route': ['A'],
+            'beg': [0.0],
+            'end': [line.length],
+            'geometry': [line],
+        }, geometry='geometry')
+        df = df.lr.set_lrs(
+            key_col=['route'],
+            loc_col='milepost',
+            beg_col='beg',
+            end_col='end',
+            geom_col='geometry',
+            closed='left_mod',
+        )
+        self.roads = df.lr.add_geom_m()
+
+    def assertClipped(self, predicate, expected):
+        """Clipping with the predicate returns the expected measures."""
+        for keep, measures in expected.items():
+            with self.subTest(keep=keep):
+                result = self.roads.lr.clip(self.mask, keep=keep, predicate=predicate)
+                np.testing.assert_array_almost_equal(
+                    result[['beg', 'end']].values, measures
+                )
+
+    def test_clip_covered_by_keeps_edge_inside(self):
+        """covered_by keeps the portion along the edge inside."""
+        # The edge portion and the inside portion are clipped separately,
+        # so they are returned as two abutting events
+        self.assertClipped('covered_by', {
+            'inside': [(5.0, 8.0), (8.0, 13.0)],
+            'outside': [(0.0, 5.0)],
+        })
+
+    def test_clip_within_moves_edge_outside(self):
+        """within moves the portion along the edge outside."""
+        self.assertClipped('within', {
+            'inside': [(8.0, 13.0)],
+            'outside': [(0.0, 5.0), (5.0, 8.0)],
+        })
 
 
 # Run tests

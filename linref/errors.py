@@ -10,6 +10,9 @@ class LRSCompatibilityError(LinrefError):
 class GeometryTopologyError(LinrefError):
     """Exception raised for errors in geometry topology."""
 
+class GeometryTopologyWarning(Warning):
+    """Warning raised for potential issues in geometry topology."""
+
 class EventTopologyError(LinrefError):
     """Exception raised for errors in event topology."""
 

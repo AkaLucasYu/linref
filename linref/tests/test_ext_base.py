@@ -23,7 +23,7 @@ from linref.options import options, set_default_lrs
 from linref.ext.base import check_compatibility
 from linref.errors import (
     LRSConfigurationError, LRSCompatibilityError, GeometryTopologyError,
-    GeometryScaleWarning, LinrefDeprecationWarning,
+    GeometryTopologyWarning, GeometryScaleWarning, LinrefDeprecationWarning,
 )
 from linref.geometry import LineStringM
 
@@ -2737,6 +2737,114 @@ class TestClipBoundaryPrecision(unittest.TestCase):
         self.assertAlmostEqual(
             (outside['end'] - outside['beg']).sum(), line.length, places=6
         )
+
+
+class TestClipGeometryTopology(unittest.TestCase):
+    """
+    Test that clip handles events whose geometry passes the same location
+    more than once according to `invalid_topology`, and clips the remaining
+    events as usual.
+    """
+
+    def setUp(self):
+        """Set up a square mask, a simple event crossing it, and a complex
+        and a closed event inside it."""
+        self.mask = Point(5, 5).buffer(5, cap_style='square')
+        # Crosses the mask from x=0 to x=10, at measures 5 to 15
+        self.simple = LineString([(-5, 5), (15, 5)])
+        # Ends on its own interior at (5, 2)
+        self.lollipop = LineString([(2, 2), (5, 2), (7, 4), (5, 6), (3, 4), (5, 2)])
+        self.ring = LineString([(2, 2), (8, 2), (8, 8), (2, 8), (2, 2)])
+
+    def _build(self, *lines):
+        """Build a GeoDataFrame with one route per line."""
+        df = gpd.GeoDataFrame({
+            'route': [chr(ord('A') + i) for i in range(len(lines))],
+            'beg': 0.0,
+            'end': [line.length for line in lines],
+            'geometry': list(lines),
+        }, geometry='geometry')
+        df = df.lr.set_lrs(
+            key_col=['route'],
+            loc_col='milepost',
+            beg_col='beg',
+            end_col='end',
+            geom_col='geometry',
+            closed='left_mod',
+        )
+        return df.lr.add_geom_m()
+
+    def assertSkipped(self, roads):
+        """Clipping warns and returns only route A, the simple event."""
+        expected = {'inside': [(5.0, 15.0)], 'outside': [(0.0, 5.0), (15.0, 20.0)]}
+        for keep, measures in expected.items():
+            with self.subTest(keep=keep):
+                with self.assertWarns(GeometryTopologyWarning):
+                    result = roads.lr.clip(self.mask, keep=keep)
+                self.assertEqual(result['route'].unique().tolist(), ['A'])
+                np.testing.assert_array_almost_equal(
+                    result[['beg', 'end']].values, measures
+                )
+
+    def test_clip_skips_complex_event(self):
+        """An event which touches itself is skipped."""
+        self.assertSkipped(self._build(self.simple, self.lollipop))
+
+    def test_clip_skips_closed_event(self):
+        """A closed event is skipped."""
+        self.assertSkipped(self._build(self.simple, self.ring))
+
+    def test_clip_simple_events_do_not_warn(self):
+        """Simple, open events raise no topology warning."""
+        roads = self._build(self.simple)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', GeometryTopologyWarning)
+            roads.lr.clip(self.mask)
+
+    def test_clip_invalid_topology_ignore(self):
+        """invalid_topology='ignore' skips the event without warning."""
+        roads = self._build(self.simple, self.ring)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', GeometryTopologyWarning)
+            result = roads.lr.clip(self.mask, invalid_topology='ignore')
+        self.assertEqual(result['route'].unique().tolist(), ['A'])
+
+    def test_clip_invalid_topology_raise(self):
+        """invalid_topology='raise' raises a GeometryTopologyError."""
+        roads = self._build(self.simple, self.ring)
+        with self.assertRaises(GeometryTopologyError):
+            roads.lr.clip(self.mask, invalid_topology='raise')
+
+    def test_clip_invalid_topology_unknown_value(self):
+        """An unknown invalid_topology value raises a ValueError."""
+        roads = self._build(self.simple)
+        with self.assertRaises(ValueError):
+            roads.lr.clip(self.mask, invalid_topology='drop')
+
+    def test_clip_missing_geometry_is_not_complex_or_closed(self):
+        """A missing geometry neither warns nor raises, and is dropped."""
+        df = gpd.GeoDataFrame({
+            'route': ['A', 'B'],
+            'beg': 0.0,
+            'end': [self.simple.length, 10.0],
+            'geometry': [self.simple, None],
+        }, geometry='geometry')
+        df['geometry_m'] = [LineStringM(self.simple, m=[0.0, self.simple.length]), None]
+        roads = df.lr.set_lrs(
+            key_col=['route'],
+            loc_col='milepost',
+            beg_col='beg',
+            end_col='end',
+            geom_col='geometry',
+            geom_m_col='geometry_m',
+            closed='left_mod',
+        )
+        for invalid_topology in ('warn', 'raise'):
+            with self.subTest(invalid_topology=invalid_topology):
+                with warnings.catch_warnings():
+                    warnings.simplefilter('error', GeometryTopologyWarning)
+                    result = roads.lr.clip(self.mask, invalid_topology=invalid_topology)
+                self.assertEqual(result['route'].unique().tolist(), ['A'])
 
 
 # Run tests

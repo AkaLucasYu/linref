@@ -16,7 +16,7 @@ from linref.events.base import EventsData
 from linref.events.utility import _method_require
 from linref.events import modify, relate, integration
 from linref import geometry
-from linref.errors import LRSConfigurationError, LRSCompatibilityError, GeometryTopologyError, GeometryMeasureError, GeometryScaleWarning, LinrefDeprecationWarning
+from linref.errors import LRSConfigurationError, LRSCompatibilityError, GeometryTopologyError, GeometryTopologyWarning, GeometryMeasureError, GeometryScaleWarning, LinrefDeprecationWarning
 from linref.ext.validation import _method_deprecates_geometry
 from linref.ext.lrs import LRS
 from linref.options import options, set_default_lrs
@@ -2340,6 +2340,7 @@ class LRS_Accessor(object):
         keep: str = 'inside',
         predicate: str | None = None,
         cut_geom: bool = True,
+        invalid_topology: str = 'warn',
     ) -> pd.DataFrame:
         """
         Clip linearly-referenced events to a polygon boundary. The portion of
@@ -2368,6 +2369,12 @@ class LRS_Accessor(object):
             carry the source events' M values. When False, the geometry and
             M-enabled geometry columns are dropped and only the clipped
             measures are returned.
+        invalid_topology : {'warn', 'ignore', 'raise'}, default 'warn'
+            How to handle events with complex or closed geometries, which
+            clip cannot handle (see Notes):
+            - 'warn' : Skip them with a ``GeometryTopologyWarning``.
+            - 'ignore' : Skip them silently.
+            - 'raise' : Raise a ``GeometryTopologyError``.
 
         Returns
         -------
@@ -2392,6 +2399,14 @@ class LRS_Accessor(object):
         also divided at points where the mask boundary grazes them without
         crossing. A tangency point therefore yields two abutting output events
         rather than one, matching the behavior of :meth:`split`.
+
+        Events whose geometry passes the same location more than once, which
+        are complex geometries that cross or touch themselves and closed
+        geometries whose ends meet, are handled according to
+        ``invalid_topology``. A location on such a geometry does not
+        correspond to a single measure, so the measures of its clipped parts
+        cannot be recovered by projection. These events need to be split into
+        simple, open events before clipping.
         """
         # Warn on use of the deprecated predicate parameter. The stacklevel
         # accounts for the `_method_require` wrapper so the warning is
@@ -2412,6 +2427,13 @@ class LRS_Accessor(object):
             raise ValueError(
                 f"Invalid value for `keep`: '{keep}'. "
                 "Must be 'inside' or 'outside'."
+            )
+
+        # Validate invalid_topology parameter
+        if invalid_topology not in ('warn', 'ignore', 'raise'):
+            raise ValueError(
+                f"Invalid value for `invalid_topology`: '{invalid_topology}'. "
+                "Must be 'warn', 'ignore', or 'raise'."
             )
 
         # Validate mask is polygon type
@@ -2436,8 +2458,36 @@ class LRS_Accessor(object):
                 "geometries. Use `split()` for LineString masks."
             )
 
-        # Union the mask polygons and clip event geometries against them
+        # Skip events whose geometry passes the same location more than once,
+        # since the measures of their clipped parts cannot be recovered by
+        # projection. Skipped geometries are replaced with None rather than
+        # dropped, so overlay results stay aligned with the source rows.
         geoms = np.asarray(self.df[self.geom_col].values)
+        # Missing geometries are not simple to shapely, but are not complex
+        # or closed either, so they are excluded from the check
+        complex_or_closed = (
+            (~shapely.is_simple(geoms) | shapely.is_closed(geoms))
+            & ~shapely.is_missing(geoms)
+        )
+        if complex_or_closed.any():
+            msg = (
+                "Events in the dataframe must all have simple, open "
+                "geometries, since complex or closed geometries cannot be "
+                "clipped reliably. Use `shapely.is_simple` and "
+                "`shapely.is_closed` to identify events with complex or "
+                "closed geometries."
+            )
+            if invalid_topology == 'raise':
+                raise GeometryTopologyError(msg)
+            if invalid_topology == 'warn':
+                warnings.warn(
+                    f"{msg} These events were skipped.",
+                    GeometryTopologyWarning,
+                    stacklevel=3,
+                )
+            geoms = np.where(complex_or_closed, None, geoms)
+
+        # Union the mask polygons and clip event geometries against them
         mask_union = shapely.union_all(mask_geom)
         # Intersection keeps the portions inside the mask, difference the
         # portions outside

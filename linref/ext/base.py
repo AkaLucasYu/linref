@@ -16,7 +16,7 @@ from linref.events.base import EventsData
 from linref.events.utility import _method_require
 from linref.events import modify, relate, integration
 from linref import geometry
-from linref.errors import LRSConfigurationError, LRSCompatibilityError, GeometryTopologyError, GeometryTopologyWarning, GeometryMeasureError, GeometryScaleWarning, LinrefDeprecationWarning
+from linref.errors import LRSConfigurationError, LRSCompatibilityError, GeometryTopologyError, GeometryTopologyWarning, GeometryMeasureError, GeometryScaleWarning
 from linref.ext.validation import _method_deprecates_geometry
 from linref.ext.lrs import LRS
 from linref.options import options, set_default_lrs
@@ -2338,7 +2338,7 @@ class LRS_Accessor(object):
         self,
         mask,
         keep: str = 'inside',
-        predicate: str | None = None,
+        predicate: str = 'covered_by',
         cut_geom: bool = True,
         invalid_topology: str = 'warn',
     ) -> pd.DataFrame:
@@ -2359,9 +2359,13 @@ class LRS_Accessor(object):
             Which clipped portions to retain:
             - 'inside' : Keep the portions of events covered by the mask.
             - 'outside' : Keep the portions of events not covered by the mask.
-        predicate : str, optional
-            Deprecated since version 1.1.0 and ignored. Membership is decided
-            by geometric overlay and no spatial predicate is consulted.
+        predicate : {'covered_by', 'within'}, default 'covered_by'
+            How to classify the portions of events which run along the mask
+            boundary:
+            - 'covered_by' : They are covered by the mask, so they are kept
+              with ``keep='inside'``.
+            - 'within' : They are not within the mask, so they are kept with
+              ``keep='outside'``.
         cut_geom : bool, default True
             Whether to retain clipped geometries in the result. When True, the
             result is a GeoDataFrame whose geometries and M-enabled geometries
@@ -2371,7 +2375,7 @@ class LRS_Accessor(object):
             measures are returned.
         invalid_topology : {'warn', 'ignore', 'raise'}, default 'warn'
             How to handle events with complex or closed geometries, which
-            clip cannot handle (see Notes):
+            clip cannot handle:
             - 'warn' : Skip them with a ``GeometryTopologyWarning``.
             - 'ignore' : Skip them silently.
             - 'raise' : Raise a ``GeometryTopologyError``.
@@ -2382,51 +2386,19 @@ class LRS_Accessor(object):
             A new DataFrame with events clipped to the mask boundary, in
             standard sort order. Returns a GeoDataFrame if ``cut_geom`` is
             True.
-
-        Notes
-        -----
-        Membership is decided by geometric overlay, using ``intersection``
-        for ``'inside'`` and ``difference`` for ``'outside'``, rather than by
-        a spatial predicate applied to split segments. Clipping produces
-        endpoints which lie on the mask boundary by construction, and those
-        positions are generally not representable in floating point, so an
-        exact predicate such as ``covered_by`` rejects segments which are
-        geometrically inside the mask. Overlay is self-consistent, so the
-        ``'inside'`` and ``'outside'`` results always tile the input events
-        exactly.
-
-        Events are clipped wherever the mask boundary crosses them, and are
-        also divided at points where the mask boundary grazes them without
-        crossing. A tangency point therefore yields two abutting output events
-        rather than one, matching the behavior of :meth:`split`.
-
-        Events whose geometry passes the same location more than once, which
-        are complex geometries that cross or touch themselves and closed
-        geometries whose ends meet, are handled according to
-        ``invalid_topology``. A location on such a geometry does not
-        correspond to a single measure, so the measures of its clipped parts
-        cannot be recovered by projection. These events need to be split into
-        simple, open events before clipping.
         """
-        # Warn on use of the deprecated predicate parameter. The stacklevel
-        # accounts for the `_method_require` wrapper so the warning is
-        # attributed to the caller.
-        if predicate is not None:
-            warnings.warn(
-                "The `predicate` parameter of `clip` is deprecated since "
-                "linref 1.1.0 and no longer has any effect. Membership is now "
-                "determined by geometric overlay against the mask, which is "
-                "exact at the mask boundary, and no spatial predicate is "
-                "consulted.",
-                LinrefDeprecationWarning,
-                stacklevel=3,
-            )
-
         # Validate keep parameter
         if keep not in ('inside', 'outside'):
             raise ValueError(
                 f"Invalid value for `keep`: '{keep}'. "
                 "Must be 'inside' or 'outside'."
+            )
+
+        # Validate predicate parameter
+        if predicate not in ('covered_by', 'within'):
+            raise ValueError(
+                f"Invalid value for `predicate`: '{predicate}'. "
+                "Must be 'covered_by' or 'within'."
             )
 
         # Validate invalid_topology parameter
@@ -2487,18 +2459,33 @@ class LRS_Accessor(object):
                 )
             geoms = np.where(complex_or_closed, None, geoms)
 
-        # Union the mask polygons and clip event geometries against them
+        # Union the mask polygons and clip event geometries against them.
+        # Intersection keeps the portions covered by the mask, difference the
+        # portions not covered by it.
         mask_union = shapely.union_all(mask_geom)
-        # Intersection keeps the portions inside the mask, difference the
-        # portions outside
-        overlay = shapely.intersection if keep == 'inside' else shapely.difference
-        clipped = overlay(geoms, mask_union)
+        if keep == 'inside':
+            clipped = shapely.intersection(geoms, mask_union)
+        else:
+            clipped = shapely.difference(geoms, mask_union)
+
+        # Portions running along the mask boundary are covered by the mask
+        # but not within it, so for `within` move them from the inside
+        # portions to the outside portions. They are taken from an overlay of
+        # each event with the boundary, rather than by overlaying the clipped
+        # portions with the boundary again, which leaves slivers where the
+        # computed crossing points miss the boundary.
+        if predicate == 'within':
+            on_boundary = shapely.intersection(geoms, shapely.boundary(mask_union))
+            if keep == 'inside':
+                clipped = shapely.difference(clipped, on_boundary)
+            else:
+                clipped = shapely.union(clipped, on_boundary)
 
         # Flatten clipped geometries to their component parts, tracking the
-        # source event each part was clipped from. Overlay returns a Point
-        # where the mask boundary grazes an event without crossing it, and an
-        # empty LineString where nothing of an event is retained; neither is a
-        # valid output event.
+        # source event each part was clipped from. Overlay can return Points,
+        # such as where the mask boundary grazes an event without crossing it,
+        # and an empty LineString where nothing of an event is retained;
+        # neither is a valid output event.
         clipped_parts, source_index = shapely.get_parts(clipped, return_index=True)
         retain = (shapely.get_type_id(clipped_parts) == 1) & ~shapely.is_empty(clipped_parts)
         clipped_parts, source_index = clipped_parts[retain], source_index[retain]
